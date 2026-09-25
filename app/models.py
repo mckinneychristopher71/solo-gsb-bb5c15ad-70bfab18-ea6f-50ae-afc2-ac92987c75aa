@@ -330,14 +330,21 @@ class ReviewResultCreate(BaseModel):
         ...,
         min_length=1,
         max_length=128,
-        description="客户端生成的幂等键，建议使用 UUID；重放返回首次结果",
+        description=(
+            "客户端生成的幂等键，建议使用 UUID；绑定首次提交的复习题与评分："
+            "同题同分重放返回首次结果（200，不重复推进日程），"
+            "复习题或评分不同返回 409（冲突检查先于到期判断）"
+        ),
     )
     score: int = Field(
         ...,
         strict=True,
         ge=0,
         le=5,
-        description="复习自评分（0~5 的整数）；低于 3 分次日重练并清零连续成功次数",
+        description=(
+            "复习自评分（0~5 的整数）；低于 3 分次日重练并清零连续成功次数；"
+            "review_id 已使用时必须与首次提交的评分一致，否则返回 409"
+        ),
     )
 
 

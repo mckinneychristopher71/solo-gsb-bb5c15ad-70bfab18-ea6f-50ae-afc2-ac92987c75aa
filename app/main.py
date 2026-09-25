@@ -53,8 +53,11 @@ answers (the ``score = 0`` frozen at answer time) into a spaced-repetition
 review plan: stem, options and the correct answer are frozen into the plan at
 creation, and re-creating the plan for the same session returns the original
 one.  ``GET /api/review/due`` lists the review items due on a UTC date and
-``POST /api/review/items/{id}/results`` records a 0~5 review score
-(idempotent by ``review_id``, due items only), advancing the SM-2 schedule
+``POST /api/review/items/{id}/results`` records a 0~5 review score: a
+``review_id`` is bound to the item and score of its first submission, so an
+identical retry replays the first result (200) without re-advancing the
+schedule while a different item or score gets 409 — this conflict check
+precedes the due-date check.  Accepted results advance the SM-2 schedule
 (ease factor floor 1.3, intervals 1/6/round(interval*EF) days) in the same
 write transaction.
 
@@ -136,7 +139,9 @@ app = FastAPI(
         "已结束会话的错题（作答时冻结 score=0）可创建间隔复习计划（SM-2）："
         "创建时冻结题干/选项/正确答案，同一会话重复创建返回原计划；"
         "支持按 UTC 日期查询到期题与提交 0~5 分复习结果"
-        "（review_id 幂等，仅接受已到期题，同一写事务记录结果并推进日程）。"
+        "（review_id 绑定首次提交的复习题与评分：同题同分重放返回首次结果且"
+        "不重复推进日程，异题或异分 409，冲突检查先于到期判断，"
+        "同一写事务记录结果并推进日程）。"
     ),
     version="1.8.0",
 )
@@ -2072,12 +2077,45 @@ def list_due_review_items(
     )
 
 
+def match_review_id_replay(
+    existing: sqlite3.Row | None, review_item_id: str, score: int
+) -> bool:
+    """Check a stored ``review_results`` row against a new submission.
+
+    ``review_id`` is bound to the review item and score of its first
+    submission.  Returns ``True`` for an exact retry (same item, same
+    score) so the caller can replay the stored result; raises 409 when the
+    key was first used for another item or another score (nothing may be
+    written); returns ``False`` when no row exists yet.
+    """
+    if existing is None:
+        return False
+    if existing["review_item_id"] != review_item_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "review_id 已绑定其他复习题"
+                f"（首次提交 review_item_id={existing['review_item_id']}，"
+                f"本次为 {review_item_id}）"
+            ),
+        )
+    if existing["score"] != score:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "review_id 已绑定不同评分"
+                f"（首次提交 score={existing['score']}，本次为 {score}）"
+            ),
+        )
+    return True
+
+
 @app.post(
     "/api/review/items/{review_item_id}/results",
     response_model=ReviewResultOut,
     status_code=201,
     tags=["review"],
-    summary="提交 0~5 分复习结果（review_id 幂等；仅接受已到期题；同事务记录结果并推进日程）",
+    summary="提交 0~5 分复习结果（review_id 绑定首次的复习题与评分：同题同分重放返回首次结果，异题或异分 409；冲突检查先于到期判断；同事务记录结果并推进日程）",
 )
 def submit_review_result(
     review_item_id: str,
@@ -2086,17 +2124,27 @@ def submit_review_result(
 ) -> ReviewResultOut | JSONResponse:
     """Record one 0~5 review score and advance the SM-2 schedule.
 
-    Idempotency contract: the client-generated ``review_id`` is the dedupe
-    key.  The idempotency lookup runs first inside the serialised write
-    transaction, so a replayed submission is served from the stored record
-    (HTTP 200) even though the first result already pushed the item's due
-    date into the future; a ``review_id`` used for a different review item
-    is rejected with 409.  An unknown review item gets a 404.
+    Idempotency contract: the client-generated ``review_id`` is bound to
+    both the review item and the score of its **first** submission.  The
+    idempotency lookup runs first inside the serialised write transaction,
+    before the due-date check:
 
-    Only **due** items accept a new result: when ``due_date`` is later than
-    today (UTC) the call is rejected with 409 and nothing is written.  A
-    first result always moves the due date at least one day out, so a second
-    *new* result for the same item on the same day cannot slip through.
+    * same item **and** same score: a replayed submission is served from
+      the stored record (HTTP 200), even though the first result already
+      pushed the item's due date into the future, and the schedule is not
+      advanced again;
+    * a different item or a different score: rejected with 409, and neither
+      the stored result nor the schedule is changed (the replay of an item
+      that is no longer due is still rejected this way, because the
+      conflict check precedes the due-date check).
+
+    An unknown review item gets a 404.
+
+    Only **due** items accept a genuinely new result: when ``due_date`` is
+    later than today (UTC) the call is rejected with 409 and nothing is
+    written.  A first result always moves the due date at least one day
+    out, so a second *new* result for the same item on the same day cannot
+    slip through.
 
     The result row (with the full before/after snapshot) and the schedule
     update are written in the **same** ``BEGIN IMMEDIATE`` transaction:
@@ -2120,16 +2168,14 @@ def submit_review_result(
         if item is None:
             raise HTTPException(status_code=404, detail="review item not found")
 
-        # 1) Idempotency replay, checked under the write lock.  A replay is
-        #    served even though the first result already moved the due date.
+        # 1) Idempotency replay / conflict, checked under the write lock and
+        #    BEFORE the due-date check.  A same-item/same-score retry is
+        #    served from the stored record even though the first result
+        #    already moved the due date; a different item or score is 409.
         existing = conn.execute(
             "SELECT * FROM review_results WHERE review_id = ?", (body.review_id,)
         ).fetchone()
-        if existing is not None:
-            if existing["review_item_id"] != review_item_id:
-                raise HTTPException(
-                    status_code=409, detail="review_id 已被其他复习题使用"
-                )
+        if match_review_id_replay(existing, review_item_id, body.score):
             stored_row, replay = existing, True
         else:
             # 2) Only due items accept a new result (UTC calendar dates
@@ -2182,18 +2228,15 @@ def submit_review_result(
                     ),
                 )
             except sqlite3.IntegrityError:
-                # Database-level backstop for a concurrent key collision.
+                # Database-level backstop for a concurrent key collision:
+                # another transaction committed this review_id first.  Apply
+                # the same bind check (item + score) after rolling back.
                 conn.rollback()
                 racer = conn.execute(
                     "SELECT * FROM review_results WHERE review_id = ?",
                     (body.review_id,),
                 ).fetchone()
-                if racer is not None:
-                    if racer["review_item_id"] != review_item_id:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="review_id 已被其他复习题使用",
-                        )
+                if match_review_id_replay(racer, review_item_id, body.score):
                     stored_row, replay = racer, True
                 else:
                     raise HTTPException(status_code=409, detail="复习结果提交冲突")
