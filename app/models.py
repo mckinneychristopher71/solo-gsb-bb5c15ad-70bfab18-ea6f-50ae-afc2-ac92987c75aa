@@ -330,7 +330,10 @@ class ReviewResultCreate(BaseModel):
         ...,
         min_length=1,
         max_length=128,
-        description="客户端生成的幂等键，建议使用 UUID；重放返回首次结果",
+        description=(
+            "客户端生成的幂等键，建议使用 UUID；绑定首次提交的复习题与评分："
+            "同题同分重放返回首次结果，题目或评分不同返回 409"
+        ),
     )
     score: int = Field(
         ...,
